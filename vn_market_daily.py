@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Environment variables
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+VNSTOCK_API_KEY = os.getenv("VNSTOCK_API_KEY")
 
 if not (BOT_TOKEN and CHAT_ID):
     logger.error("❌ Missing Telegram credentials!")
@@ -68,28 +69,36 @@ class DB:
 # ======================== FETCH VN DATA (vnstock) ========================
 def fetch_vn_data():
     """
-    Fetch VN data using vnstock with rate limiting.
-    vnstock allows 60 calls/minute, but we use batch request to minimize calls.
+    Fetch VN data using vnstock with API key (if available).
+    With API key: 60 requests/minute
+    Without API key: 20 requests/minute
     """
-    logger.info("📥 Fetching VN data via vnstock (batch mode)...")
+    logger.info("📥 Fetching VN data via vnstock...")
     
     try:
-        # Import vnstock new API
         from vnstock.api.quote import Quote
         
-        # Batch request all symbols at once (1 API call instead of 8)
-        # This is the key to stay within rate limit
-        logger.info(f"Requesting data for {len(SYMBOLS_VN)} symbols...")
+        # Get API key from environment variable
+        api_key = os.getenv("VNSTOCK_API_KEY")
+        
+        if api_key:
+            logger.info("✅ Using VNSTOCK API Key (60 req/min)")
+        else:
+            logger.warning("⚠️ No API Key found - using Guest mode (20 req/min)")
         
         all_data = []
         for symbol in SYMBOLS_VN:
             try:
-                # Fetch 30 days of data
-                quote = Quote(symbol=symbol, source='VCI')
+                # Initialize Quote with API key if available
+                if api_key:
+                    quote = Quote(symbol=symbol, source='VCI', api_key=api_key)
+                else:
+                    quote = Quote(symbol=symbol, source='VCI')
+                
+                # Fetch 30 days of history
                 df = quote.history(period='30d')
                 
                 if df is not None and not df.empty:
-                    # Get latest row
                     latest = df.iloc[-1]
                     date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
                     
@@ -104,19 +113,25 @@ def fetch_vn_data():
                     ))
                     logger.info(f"✅ Fetched {symbol}: {latest.get('Close', 0)}")
                     
-                    # Rate limiting: wait 0.5s between requests (safe for 60/min limit)
-                    time.sleep(0.5)
+                    # Rate limiting:
+                    # - With API key (60/min): sleep 1.0 second
+                    # - Without API key (20/min): sleep 3.5 seconds
+                    sleep_time = 1.0 if api_key else 3.5
+                    time.sleep(sleep_time)
                 else:
                     logger.warning(f"⚠️ No data for {symbol}")
                     
             except Exception as e:
                 logger.error(f"❌ Error fetching {symbol}: {str(e)[:60]}")
+                # Still wait to respect rate limit
+                time.sleep(1.0 if api_key else 3.5)
                 continue
         
+        logger.info(f"📊 Total fetched: {len(all_data)}/{len(SYMBOLS_VN)} symbols")
         return all_data
         
     except ImportError:
-        logger.error("❌ vnstock not installed. Try: pip install vnstock")
+        logger.error("❌ vnstock not installed. Run: pip install vnstock")
         return []
     except Exception as e:
         logger.error(f"❌ vnstock fetch failed: {e}")
