@@ -13,18 +13,6 @@ logger = logging.getLogger(__name__)
 # Environment variables
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-VNSTOCK_API_KEY = os.getenv("VNSTOCK_API_KEY")
-
-# Debug credentials
-logger.info("=" * 60)
-logger.info("🔍 CHECKING CREDENTIALS:")
-logger.info(f"  BOT_TOKEN exists: {bool(BOT_TOKEN)}")
-logger.info(f"  CHAT_ID exists: {bool(CHAT_ID)}")
-logger.info(f"  VNSTOCK_API_KEY exists: {bool(VNSTOCK_API_KEY)}")
-if VNSTOCK_API_KEY:
-    logger.info(f"  VNSTOCK_API_KEY length: {len(VNSTOCK_API_KEY)}")
-    logger.info(f"  VNSTOCK_API_KEY preview: {VNSTOCK_API_KEY[:10]}...")
-logger.info("=" * 60)
 
 if not (BOT_TOKEN and CHAT_ID):
     logger.error("❌ Missing Telegram credentials!")
@@ -77,101 +65,130 @@ class DB:
     def close(self):
         self.conn.close()
 
-# ======================== FETCH VN DATA (vnstock) ========================
+# ======================== FETCH VN DATA (vnstock NEW API) ========================
 def fetch_vn_data():
     """
-    Fetch VN data using vnstock with multiple authentication methods.
+    Fetch VN data using vnstock new API (v4.0+)
+    According to vnstock documentation, we need to use vnstock_data module
     """
-    logger.info("📥 Fetching VN data via vnstock...")
+    logger.info("📥 Fetching VN data via vnstock (NEW API)...")
     
     try:
-        from vnstock.api.quote import Quote
+        # Try new vnstock API v4.0+
+        from vnstock import Vnstock
         
-        api_key = os.getenv("VNSTOCK_API_KEY")
+        logger.info("✅ Using vnstock Vnstock class (new API)")
         
-        logger.info(f"🔑 API Key status: {'Found' if api_key else 'NOT FOUND'}")
+        # Initialize once
+        vns = Vnstock()
         
         all_data = []
-        for i, symbol in enumerate(SYMBOLS_VN):
+        for symbol in SYMBOLS_VN:
             try:
-                # Try different authentication methods
-                quote = None
+                logger.info(f"  Fetching {symbol}...")
                 
-                # Method 1: Pass api_key parameter
-                if api_key:
-                    try:
-                        logger.info(f"  Trying Method 1: api_key parameter for {symbol}")
-                        quote = Quote(symbol=symbol, source='VCI', api_key=api_key)
-                    except Exception as e1:
-                        logger.warning(f"  Method 1 failed: {str(e1)[:50]}")
-                        
-                        # Method 2: Try without api_key (guest mode)
-                        try:
-                            logger.info(f"  Trying Method 2: guest mode for {symbol}")
-                            quote = Quote(symbol=symbol, source='VCI')
-                        except Exception as e2:
-                            logger.warning(f"  Method 2 failed: {str(e2)[:50]}")
-                            # Method 3: Try with token parameter
-                            try:
-                                logger.info(f"  Trying Method 3: token parameter for {symbol}")
-                                quote = Quote(symbol=symbol, source='VCI', token=api_key)
-                            except Exception as e3:
-                                logger.error(f"  Method 3 failed: {str(e3)[:50]}")
-                                continue
-                        else:
-                            logger.info("  ✅ Method 2 (guest) worked!")
-                    else:
-                        logger.info("  ✅ Method 1 (api_key) worked!")
-                else:
-                    # No API key - use guest mode
-                    logger.info(f"  Using guest mode (no API key) for {symbol}")
-                    quote = Quote(symbol=symbol, source='VCI')
+                # Fetch data - new API syntax
+                df = vns.quote.history(
+                    symbol=symbol,
+                    start=(datetime.date.today() - datetime.timedelta(days=30)).isoformat(),
+                    end=TODAY,
+                    resolution='1D'
+                )
                 
-                # Fetch data
-                if quote:
-                    df = quote.history(period='30d')
+                if df is not None and not df.empty:
+                    # Get latest row
+                    latest = df.iloc[-1]
                     
-                    if df is not None and not df.empty:
-                        latest = df.iloc[-1]
-                        date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
-                        
-                        all_data.append((
-                            date_str, symbol,
-                            float(latest.get('Open', 0)),
-                            float(latest.get('High', 0)),
-                            float(latest.get('Low', 0)),
-                            float(latest.get('Close', 0)),
-                            float(latest.get('Volume', 0)),
-                            'vnstock'
-                        ))
-                        logger.info(f"✅ Fetched {symbol}: {latest.get('Close', 0)}")
-                        
-                        # Rate limiting - be conservative
-                        if api_key:
-                            time.sleep(1.2)  # 60/min = 1/sec, add buffer
-                        else:
-                            time.sleep(3.5)  # 20/min = 1/3sec
-                    else:
-                        logger.warning(f"⚠️ No data for {symbol}")
+                    # Extract data safely
+                    date_str = latest.get('time', TODAY)
+                    if isinstance(date_str, pd.Timestamp):
+                        date_str = date_str.strftime("%Y-%m-%d")
+                    
+                    open_price = float(latest.get('open', 0))
+                    high_price = float(latest.get('high', 0))
+                    low_price = float(latest.get('low', 0))
+                    close_price = float(latest.get('close', 0))
+                    volume = float(latest.get('volume', 0))
+                    
+                    all_data.append((
+                        date_str, symbol,
+                        open_price, high_price, low_price,
+                        close_price, volume,
+                        'vnstock'
+                    ))
+                    logger.info(f"✅ {symbol}: {close_price} (Vol: {volume:,.0f})")
+                    
+                    # Rate limiting: 1 second between requests
+                    time.sleep(1.0)
+                else:
+                    logger.warning(f"⚠️ No data for {symbol}")
                     
             except Exception as e:
                 logger.error(f"❌ Error fetching {symbol}: {str(e)[:80]}")
-                logger.error(f"   Full error: {traceback.format_exc()[:200]}")
-                time.sleep(2.0)
+                time.sleep(1.0)
                 continue
         
         logger.info(f"📊 Total fetched: {len(all_data)}/{len(SYMBOLS_VN)} symbols")
         return all_data
         
-    except ImportError as e:
-        logger.error(f"❌ vnstock not installed: {e}")
-        return []
+    except ImportError:
+        logger.error("❌ vnstock not installed. Trying fallback...")
+        return fetch_vn_yfinance()
     except Exception as e:
-        logger.error(f"❌ vnstock fetch failed: {e}")
-        logger.error(traceback.format_exc())
-        return []
+        logger.error(f"❌ vnstock failed: {e}")
+        return fetch_vn_yfinance()
 
-# ======================== FETCH GLOBAL DATA (yfinance) ========================
+def fetch_vn_yfinance():
+    """
+    Fallback: Fetch VN data using yfinance (less reliable but works)
+    """
+    logger.info("📥 Fetching VN data via yfinance (fallback)...")
+    
+    # Map VN symbols to yfinance format
+    yf_symbols = {
+        "VNINDEX": "^VNINDEX",
+        "VN30": "VN30F1M.HO",
+        "VCB": "VCB.HO",
+        "VIC": "VIC.HO",
+        "VNM": "VNM.HO",
+        "TCB": "TCB.HO",
+        "HPG": "HPG.HO",
+        "FPT": "FPT.HO"
+    }
+    
+    all_data = []
+    for symbol, yf_symbol in yf_symbols.items():
+        try:
+            logger.info(f"  Fetching {symbol} ({yf_symbol})...")
+            
+            df = yf.download(yf_symbol, period='30d', progress=False)
+            
+            if not df.empty:
+                latest = df.iloc[-1]
+                date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
+                
+                all_data.append((
+                    date_str, symbol,
+                    float(latest.get('Open', 0)),
+                    float(latest.get('High', 0)),
+                    float(latest.get('Low', 0)),
+                    float(latest.get('Close', 0)),
+                    float(latest.get('Volume', 0)),
+                    'yfinance'
+                ))
+                logger.info(f"✅ {symbol}: {latest.get('Close', 0)}")
+                
+                time.sleep(0.5)
+            else:
+                logger.warning(f"⚠️ No data for {symbol}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error fetching {symbol}: {str(e)[:60]}")
+            continue
+    
+    return all_data
+
+# ======================== FETCH GLOBAL DATA ========================
 def fetch_global_data():
     """Fetch global markets using yfinance"""
     logger.info("📥 Fetching Global data via yfinance...")
@@ -307,60 +324,36 @@ def analyze(db):
     
     return scenarios
 
-# ======================== PDF GENERATOR ========================
-def download_font():
-    font_path = "/tmp/NotoSans-Regular.ttf"
-    if os.path.exists(font_path):
-        return font_path
-    
-    logger.info("Downloading font...")
-    url = "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200 and len(response.content) > 10000:
-            with open(font_path, "wb") as f:
-                f.write(response.content)
-            logger.info("✅ Font downloaded")
-            return font_path
-    except Exception as e:
-        logger.error(f"❌ Font download failed: {e}")
-    return None
-
-class PDFGenerator(FPDF):
-    def __init__(self, font_path):
-        super().__init__()
-        if font_path:
-            self.add_font("NotoSans", "", font_path)
-            self.add_font("NotoSans", "B", font_path)
-            self.font_name = "NotoSans"
-        else:
-            self.font_name = "Helvetica"
-    
+# ======================== PDF GENERATOR (SIMPLIFIED) ========================
+class SimplePDF(FPDF):
     def header(self):
-        self.set_font(self.font_name, "B", 14)
+        self.set_font("Helvetica", "B", 12)
         self.cell(0, 10, "BAO CAO THI TRUONG CHUNG KHOAN VN", ln=True, align="C")
-        self.set_font(self.font_name, "", 9)
-        self.cell(0, 5, f"Ngay: {TODAY} | Nguon: vnstock + yfinance", ln=True, align="C")
+        self.set_font("Helvetica", "", 9)
+        self.cell(0, 5, f"Ngay: {TODAY}", ln=True, align="C")
         self.line(10, 20, 200, 20)
         self.ln(5)
     
     def footer(self):
         self.set_y(-15)
-        self.set_font(self.font_name, "I", 8)
-        self.cell(0, 10, "⚠️ Du lieu co sai so ky thuat. Khong thay the tu van chuyen nghiep.", align="C")
+        self.set_font("Helvetica", "I", 8)
+        self.cell(0, 10, "Du lieu tu vnstock + yfinance", align="C")
     
     def section(self, title, lines):
-        self.set_font(self.font_name, "B", 11)
-        self.set_fill_color(235, 235, 235)
-        self.cell(0, 8, f"  {title}", fill=True, ln=True)
-        self.set_font(self.font_name, "", 9)
+        self.set_font("Helvetica", "B", 10)
+        self.set_fill_color(230, 230, 230)
+        self.cell(0, 7, f"  {title}", fill=True, ln=True)
+        self.set_font("Helvetica", "", 8)
         for line in lines:
-            self.multi_cell(0, 5, f"- {line}")
+            # Truncate long lines
+            safe_line = line[:100] if len(line) > 100 else line
+            self.multi_cell(0, 4, f"- {safe_line}")
         self.ln(2)
 
 def generate_pdf(vn_data, global_data, scenarios, quality):
-    font_path = download_font()
-    pdf = PDFGenerator(font_path)
+    logger.info("📄 Generating PDF...")
+    
+    pdf = SimplePDF()
     pdf.add_page()
     
     # VN data
@@ -373,7 +366,7 @@ def generate_pdf(vn_data, global_data, scenarios, quality):
     
     # Scenarios
     scenario_lines = [
-        f"{t}: Bear {bp:.0f}% ({bt}) | Base {bsp:.0f}% ({bst}+/-{err}%) | Bull {bup:.0f}% ({but})"
+        f"{t}: Bear {bp:.0f}% ({bt}) | Base {bsp:.0f}% ({bst}) | Bull {bup:.0f}% ({but})"
         for t, bp, bsp, bup, bt, bst, but, err in scenarios
     ]
     pdf.section("3. KICH BAN 1 NGAY", scenario_lines or ["Khong co du lieu"])
@@ -381,7 +374,7 @@ def generate_pdf(vn_data, global_data, scenarios, quality):
     # Quality
     quality_lines = [
         f"Thieu: {quality['miss']}/{quality['total']} | Sai so: +/-{quality['err']}%",
-        f"Ghi chu: {quality['notes']}"
+        f"Ghi chu: {quality['notes'][:80]}" if quality['notes'] else ""
     ]
     pdf.section("4. CHAT LUONG DU LIEU", quality_lines)
     
