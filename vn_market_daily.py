@@ -4,7 +4,6 @@ import os, sys, datetime, logging, requests, sqlite3, json, traceback, time
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from fpdf import FPDF
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
@@ -65,41 +64,32 @@ class DB:
     def close(self):
         self.conn.close()
 
-# ======================== FETCH VN DATA (vnstock NEW API) ========================
+# ======================== FETCH VN DATA (NEW VNSTOCK API) ========================
 def fetch_vn_data():
     """
-    Fetch VN data using vnstock new API (v4.0+)
-    According to vnstock documentation, we need to use vnstock_data module
+    Fetch VN data using vnstock NEW API v4.0+
+    from vnstock.api.quote import Quote
     """
-    logger.info("📥 Fetching VN data via vnstock (NEW API)...")
+    logger.info("📥 Fetching VN data via vnstock (NEW API v4.0+)...")
+    
+    all_data = []
     
     try:
-        # Try new vnstock API v4.0+
-        from vnstock import Vnstock
+        from vnstock.api.quote import Quote
         
-        logger.info("✅ Using vnstock Vnstock class (new API)")
+        logger.info("✅ Using vnstock.api.quote.Quote (NEW API)")
         
-        # Initialize once
-        vns = Vnstock()
-        
-        all_data = []
         for symbol in SYMBOLS_VN:
             try:
                 logger.info(f"  Fetching {symbol}...")
                 
-                # Fetch data - new API syntax
-                df = vns.quote.history(
-                    symbol=symbol,
-                    start=(datetime.date.today() - datetime.timedelta(days=30)).isoformat(),
-                    end=TODAY,
-                    resolution='1D'
-                )
+                # NEW API syntax
+                q = Quote(symbol=symbol, source='VCI')
+                df = q.history(period='30d')
                 
                 if df is not None and not df.empty:
-                    # Get latest row
                     latest = df.iloc[-1]
                     
-                    # Extract data safely
                     date_str = latest.get('time', TODAY)
                     if isinstance(date_str, pd.Timestamp):
                         date_str = date_str.strftime("%Y-%m-%d")
@@ -116,9 +106,9 @@ def fetch_vn_data():
                         close_price, volume,
                         'vnstock'
                     ))
-                    logger.info(f"✅ {symbol}: {close_price} (Vol: {volume:,.0f})")
+                    logger.info(f"✅ {symbol}: {close_price}")
                     
-                    # Rate limiting: 1 second between requests
+                    # Rate limiting
                     time.sleep(1.0)
                 else:
                     logger.warning(f"⚠️ No data for {symbol}")
@@ -128,23 +118,20 @@ def fetch_vn_data():
                 time.sleep(1.0)
                 continue
         
-        logger.info(f"📊 Total fetched: {len(all_data)}/{len(SYMBOLS_VN)} symbols")
-        return all_data
-        
     except ImportError:
-        logger.error("❌ vnstock not installed. Trying fallback...")
-        return fetch_vn_yfinance()
+        logger.error("❌ vnstock.api.quote not available, using yfinance fallback")
+        all_data = fetch_vn_yfinance()
     except Exception as e:
         logger.error(f"❌ vnstock failed: {e}")
-        return fetch_vn_yfinance()
+        all_data = fetch_vn_yfinance()
+    
+    logger.info(f"📊 Total fetched: {len(all_data)}/{len(SYMBOLS_VN)} symbols")
+    return all_data
 
 def fetch_vn_yfinance():
-    """
-    Fallback: Fetch VN data using yfinance (less reliable but works)
-    """
+    """Fallback to yfinance for VN stocks"""
     logger.info("📥 Fetching VN data via yfinance (fallback)...")
     
-    # Map VN symbols to yfinance format
     yf_symbols = {
         "VNINDEX": "^VNINDEX",
         "VN30": "VN30F1M.HO",
@@ -159,8 +146,6 @@ def fetch_vn_yfinance():
     all_data = []
     for symbol, yf_symbol in yf_symbols.items():
         try:
-            logger.info(f"  Fetching {symbol} ({yf_symbol})...")
-            
             df = yf.download(yf_symbol, period='30d', progress=False)
             
             if not df.empty:
@@ -179,9 +164,6 @@ def fetch_vn_yfinance():
                 logger.info(f"✅ {symbol}: {latest.get('Close', 0)}")
                 
                 time.sleep(0.5)
-            else:
-                logger.warning(f"⚠️ No data for {symbol}")
-                
         except Exception as e:
             logger.error(f"❌ Error fetching {symbol}: {str(e)[:60]}")
             continue
@@ -190,7 +172,6 @@ def fetch_vn_yfinance():
 
 # ======================== FETCH GLOBAL DATA ========================
 def fetch_global_data():
-    """Fetch global markets using yfinance"""
     logger.info("📥 Fetching Global data via yfinance...")
     
     try:
@@ -260,7 +241,6 @@ def fetch_all_data(db):
 def analyze(db):
     logger.info("📈 Analyzing market data...")
     
-    # Get today's data or most recent
     prices = db.query("SELECT * FROM prices WHERE date=?", (TODAY,))
     if not prices:
         last_date = db.query("SELECT date FROM prices ORDER BY date DESC LIMIT 1")
@@ -273,7 +253,6 @@ def analyze(db):
         if ticker not in SYMBOLS_VN:
             continue
         
-        # Get historical data for ATR
         hist = db.query(
             "SELECT high, low, close FROM prices WHERE ticker=? ORDER BY date DESC LIMIT 20",
             (ticker,)
@@ -282,15 +261,11 @@ def analyze(db):
         if len(hist) < 5:
             continue
         
-        # Calculate ATR (14-period)
+        # Calculate ATR
         tr_list = []
         for i in range(1, min(14, len(hist))):
             high_prev, low_prev, close_prev = hist[i][0], hist[i][1], hist[i-1][2]
-            tr = max(
-                abs(high_prev - low_prev),
-                abs(high_prev - close_prev),
-                abs(low_prev - close_prev)
-            )
+            tr = max(abs(high_prev - low_prev), abs(high_prev - close_prev), abs(low_prev - close_prev))
             tr_list.append(tr)
         
         atr = np.mean(tr_list) if tr_list else c * 0.02
@@ -300,22 +275,16 @@ def analyze(db):
         r1 = 2 * pivot - l
         s1 = 2 * pivot - h
         
-        # Scenario targets
+        # Scenarios
         bear_target = s1 - atr * 0.5
         base_target = pivot
         bull_target = r1 + atr * 0.5
         
-        # Probabilities
-        bear_prob, base_prob, bull_prob = 30.0, 40.0, 30.0
-        
-        # Error percentage
-        err_pct = round((atr / c) * 100, 1) if c > 0 else 15.0
-        
         scenarios.append((
             TODAY, ticker,
-            bear_prob, base_prob, bull_prob,
+            30.0, 40.0, 30.0,
             round(bear_target, 2), round(base_target, 2), round(bull_target, 2),
-            err_pct
+            round((atr / c) * 100, 1) if c > 0 else 15.0
         ))
     
     if scenarios:
@@ -324,80 +293,80 @@ def analyze(db):
     
     return scenarios
 
-# ======================== PDF GENERATOR (SIMPLIFIED) ========================
-class SimplePDF(FPDF):
-    def header(self):
-        self.set_font("Helvetica", "B", 12)
-        self.cell(0, 10, "BAO CAO THI TRUONG CHUNG KHOAN VN", ln=True, align="C")
-        self.set_font("Helvetica", "", 9)
-        self.cell(0, 5, f"Ngay: {TODAY}", ln=True, align="C")
-        self.line(10, 20, 200, 20)
-        self.ln(5)
+# ======================== GENERATE TEXT REPORT ========================
+def generate_text_report(vn_data, global_data, scenarios, quality):
+    """Generate text message for Telegram"""
+    logger.info("📝 Generating text report...")
     
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.cell(0, 10, "Du lieu tu vnstock + yfinance", align="C")
+    lines = []
+    lines.append(f"📊 *BÁO CÁO THỊ TRƯỜNG CKVN*")
+    lines.append(f"📅 Ngày: {TODAY}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
     
-    def section(self, title, lines):
-        self.set_font("Helvetica", "B", 10)
-        self.set_fill_color(230, 230, 230)
-        self.cell(0, 7, f"  {title}", fill=True, ln=True)
-        self.set_font("Helvetica", "", 8)
-        for line in lines:
-            # Truncate long lines
-            safe_line = line[:100] if len(line) > 100 else line
-            self.multi_cell(0, 4, f"- {safe_line}")
-        self.ln(2)
-
-def generate_pdf(vn_data, global_data, scenarios, quality):
-    logger.info("📄 Generating PDF...")
+    # VN Indices
+    lines.append("🇻🇳 *CHỈ SỐ VIỆT NAM*")
+    if vn_data:
+        for t, c, v in vn_data:
+            lines.append(f"• {t}: *{c:,.0f}* (Vol: {v:,.0f})")
+    else:
+        lines.append("• Không có dữ liệu")
+    lines.append("")
     
-    pdf = SimplePDF()
-    pdf.add_page()
-    
-    # VN data
-    vn_lines = [f"{t}: {c} (Vol: {int(v):,})" for t, c, v in vn_data]
-    pdf.section("1. CHI SO VIET NAM", vn_lines or ["Khong co du lieu"])
-    
-    # Global data
-    global_lines = [f"{t}: {c}" for t, c in global_data]
-    pdf.section("2. LIEN THI TRUONG", global_lines or ["Khong co du lieu"])
+    # Global Markets
+    lines.append("🌍 *LIÊN THỊ TRƯỜNG*")
+    if global_data:
+        for t, c in global_data:
+            lines.append(f"• {t}: *{c:,.2f}*")
+    else:
+        lines.append("• Không có dữ liệu")
+    lines.append("")
     
     # Scenarios
-    scenario_lines = [
-        f"{t}: Bear {bp:.0f}% ({bt}) | Base {bsp:.0f}% ({bst}) | Bull {bup:.0f}% ({but})"
-        for t, bp, bsp, bup, bt, bst, but, err in scenarios
-    ]
-    pdf.section("3. KICH BAN 1 NGAY", scenario_lines or ["Khong co du lieu"])
+    lines.append("📈 *KỊCH BẢN 1 NGÀY*")
+    if scenarios:
+        for t, bp, bsp, bup, bt, bst, but, err in scenarios[:3]:  # Top 3 only
+            lines.append(f"• {t}:")
+            lines.append(f"  🐻 Bear {bp:.0f}%: {bt}")
+            lines.append(f"  ⚖️ Base {bsp:.0f}%: {bst} ±{err}%")
+            lines.append(f"  🐂 Bull {bup:.0f}%: {but}")
+    else:
+        lines.append("• Không có dữ liệu")
+    lines.append("")
     
     # Quality
-    quality_lines = [
-        f"Thieu: {quality['miss']}/{quality['total']} | Sai so: +/-{quality['err']}%",
-        f"Ghi chu: {quality['notes'][:80]}" if quality['notes'] else ""
-    ]
-    pdf.section("4. CHAT LUONG DU LIEU", quality_lines)
+    lines.append("📋 *CHẤT LƯỢNG DỮ LIỆU*")
+    lines.append(f"• Thiếu: {quality['miss']}/{quality['total']}")
+    lines.append(f"• Sai số: ±{quality['err']}%")
+    if quality['notes']:
+        lines.append(f"• Ghi chú: {quality['notes'][:50]}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("⚠️ *Lưu ý:* Dữ liệu mang tính chất tham khảo")
+    lines.append("Nguồn: vnstock + yfinance (Free API)")
     
-    try:
-        return pdf.output(dest="S").encode("latin1")
-    except Exception as e:
-        logger.error(f"❌ PDF generation failed: {e}")
-        return b"PDF generation failed"
+    return "\n".join(lines)
 
 # ======================== SEND TELEGRAM ========================
-def send_telegram(pdf_bytes, filename="market_report.pdf"):
-    logger.info("📤 Sending to Telegram...")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+def send_telegram_message(text):
+    """Send text message to Telegram"""
+    logger.info("📤 Sending text message to Telegram...")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     
     try:
         response = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": f"📊 Bao cao thi truong - {TODAY}"},
-            files={"document": (filename, pdf_bytes, "application/pdf")},
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown"
+            },
             timeout=30
         )
         if response.status_code == 200:
-            logger.info("✅ Telegram sent!")
+            logger.info("✅ Telegram message sent!")
             return True
         else:
             logger.error(f"❌ Telegram error: {response.status_code} - {response.text}")
@@ -418,7 +387,7 @@ def main():
         # Analyze
         scenarios = analyze(db)
         
-        # Get data for PDF
+        # Get data for report
         run_date = db.query("SELECT date FROM prices ORDER BY date DESC LIMIT 1")
         run_date = run_date[0][0] if run_date else TODAY
         
@@ -441,8 +410,8 @@ def main():
         db.close()
         
         # Generate & send
-        pdf_bytes = generate_pdf(vn_data, global_data, scenarios, quality)
-        if send_telegram(pdf_bytes, f"VN_Market_{run_date.replace('-', '')}.pdf"):
+        report_text = generate_text_report(vn_data, global_data, scenarios, quality)
+        if send_telegram_message(report_text):
             logger.info("🎉 Done!")
         else:
             sys.exit(1)
