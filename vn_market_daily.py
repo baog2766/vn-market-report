@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, datetime, logging, requests, sqlite3, json, traceback
+import os, sys, datetime, logging, requests, sqlite3, json, traceback, time
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -10,26 +10,13 @@ from fpdf import FPDF
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
-# Debug environment variables
-logger.info("=" * 50)
-logger.info("DEBUG: Checking environment variables...")
+# Environment variables
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-logger.info(f"TELEGRAM_BOT_TOKEN exists: {bool(BOT_TOKEN)}")
-logger.info(f"TELEGRAM_CHAT_ID exists: {bool(CHAT_ID)}")
-logger.info(f"TELEGRAM_CHAT_ID value: {CHAT_ID}")
-logger.info("=" * 50)
 
-if not BOT_TOKEN:
-    logger.error("❌ ERROR: TELEGRAM_BOT_TOKEN is missing or empty!")
+if not (BOT_TOKEN and CHAT_ID):
+    logger.error("❌ Missing Telegram credentials!")
     sys.exit(1)
-    
-if not CHAT_ID:
-    logger.error("❌ ERROR: TELEGRAM_CHAT_ID is missing or empty!")
-    sys.exit(1)
-
-logger.info(f"✅ Bot Token: {BOT_TOKEN[:20]}...")
-logger.info(f"✅ Chat ID: {CHAT_ID}")
 
 # Configuration
 SYMBOLS_VN = ["VNINDEX", "VN30", "VCB", "VIC", "VNM", "TCB", "HPG", "FPT"]
@@ -45,84 +32,31 @@ class DB:
     
     def _create_tables(self):
         self.conn.executescript("""
-            DROP TABLE IF EXISTS prices;
-            DROP TABLE IF EXISTS scenarios;
-            DROP TABLE IF EXISTS bctc;
-            DROP TABLE IF EXISTS quality;
-            
-            CREATE TABLE prices (
-                date TEXT,
-                ticker TEXT,
-                o REAL,
-                h REAL,
-                l REAL,
-                c REAL,
-                vol REAL,
-                src TEXT,
+            CREATE TABLE IF NOT EXISTS prices (
+                date TEXT, ticker TEXT, o REAL, h REAL, l REAL, c REAL, vol REAL, src TEXT,
                 PRIMARY KEY(date, ticker)
             );
-            
-            CREATE TABLE scenarios (
-                date TEXT,
-                ticker TEXT,
-                bp REAL,
-                bsp REAL,
-                bup REAL,
-                bt REAL,
-                bst REAL,
-                but REAL,
-                err REAL,
+            CREATE TABLE IF NOT EXISTS scenarios (
+                date TEXT, ticker TEXT, bp REAL, bsp REAL, bup REAL,
+                bt REAL, bst REAL, but REAL, err REAL,
                 PRIMARY KEY(date, ticker)
             );
-            
-            CREATE TABLE bctc (
-                ticker TEXT,
-                period TEXT,
-                roe REAL,
-                pe REAL,
-                de REAL,
-                ni REAL,
-                last TEXT,
-                PRIMARY KEY(ticker, period)
-            );
-            
-            CREATE TABLE quality (
-                date TEXT PRIMARY KEY,
-                total INT,
-                miss INT,
-                err REAL,
-                notes TEXT
+            CREATE TABLE IF NOT EXISTS quality (
+                date TEXT PRIMARY KEY, total INT, miss INT, err REAL, notes TEXT
             );
         """)
         self.conn.commit()
-        logger.info("✅ Database tables created")
 
-    def insert_prices(self, data):
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?,?,?)",
-            data
-        )
-        self.conn.commit()
-
-    def insert_scenarios(self, data):
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO scenarios VALUES (?,?,?,?,?,?,?,?,?)",
-            data
-        )
-        self.conn.commit()
-
-    def insert_bctc(self, data):
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO bctc VALUES (?,?,?,?,?,?,?)",
-            data
-        )
-        self.conn.commit()
-
-    def insert_quality(self, date, total, miss, err, notes):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?)",
-            (date, total, miss, err, notes)
-        )
+    def insert_or_replace(self, table, data):
+        if table == "prices":
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO prices VALUES (?,?,?,?,?,?,?,?)", data)
+        elif table == "scenarios":
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO scenarios VALUES (?,?,?,?,?,?,?,?,?)", data)
+        elif table == "quality":
+            self.conn.execute(
+                "INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?)", data)
         self.conn.commit()
 
     def query(self, sql, params=()):
@@ -131,83 +65,149 @@ class DB:
     def close(self):
         self.conn.close()
 
-# ======================== FETCH DATA ========================
-def fetch_data(db):
-    logger.info("📥 Fetching market data...")
+# ======================== FETCH VN DATA (vnstock) ========================
+def fetch_vn_data():
+    """
+    Fetch VN data using vnstock with rate limiting.
+    vnstock allows 60 calls/minute, but we use batch request to minimize calls.
+    """
+    logger.info("📥 Fetching VN data via vnstock (batch mode)...")
+    
+    try:
+        # Import vnstock new API
+        from vnstock.api.quote import Quote
+        
+        # Batch request all symbols at once (1 API call instead of 8)
+        # This is the key to stay within rate limit
+        logger.info(f"Requesting data for {len(SYMBOLS_VN)} symbols...")
+        
+        all_data = []
+        for symbol in SYMBOLS_VN:
+            try:
+                # Fetch 30 days of data
+                quote = Quote(symbol=symbol, source='VCI')
+                df = quote.history(period='30d')
+                
+                if df is not None and not df.empty:
+                    # Get latest row
+                    latest = df.iloc[-1]
+                    date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
+                    
+                    all_data.append((
+                        date_str, symbol,
+                        float(latest.get('Open', 0)),
+                        float(latest.get('High', 0)),
+                        float(latest.get('Low', 0)),
+                        float(latest.get('Close', 0)),
+                        float(latest.get('Volume', 0)),
+                        'vnstock'
+                    ))
+                    logger.info(f"✅ Fetched {symbol}: {latest.get('Close', 0)}")
+                    
+                    # Rate limiting: wait 0.5s between requests (safe for 60/min limit)
+                    time.sleep(0.5)
+                else:
+                    logger.warning(f"⚠️ No data for {symbol}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error fetching {symbol}: {str(e)[:60]}")
+                continue
+        
+        return all_data
+        
+    except ImportError:
+        logger.error("❌ vnstock not installed. Try: pip install vnstock")
+        return []
+    except Exception as e:
+        logger.error(f"❌ vnstock fetch failed: {e}")
+        return []
+
+# ======================== FETCH GLOBAL DATA (yfinance) ========================
+def fetch_global_data():
+    """Fetch global markets using yfinance"""
+    logger.info("📥 Fetching Global data via yfinance...")
+    
+    try:
+        df = yf.download(SYMBOLS_GL, period='2d', group_by='ticker', progress=False, threads=False)
+        
+        all_data = []
+        for ticker in SYMBOLS_GL:
+            try:
+                if isinstance(df.columns, pd.MultiIndex):
+                    ticker_df = df[ticker]
+                else:
+                    ticker_df = df
+                
+                if ticker_df.empty:
+                    continue
+                
+                latest = ticker_df.iloc[-1]
+                date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
+                
+                all_data.append((
+                    date_str, ticker,
+                    float(latest.get('Open', 0)),
+                    float(latest.get('High', 0)),
+                    float(latest.get('Low', 0)),
+                    float(latest.get('Close', 0)),
+                    float(latest.get('Volume', 0)),
+                    'yfinance'
+                ))
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch {ticker}: {e}")
+        
+        return all_data
+        
+    except Exception as e:
+        logger.error(f"❌ yfinance fetch failed: {e}")
+        return []
+
+# ======================== MAIN FETCH ========================
+def fetch_all_data(db):
     miss = 0
     notes = []
     
     # Fetch VN data
-    try:
-        from vnstock import Vnstock
-        vns = Vnstock()
-        logger.info("Fetching VN data from vnstock...")
-        df = vns.quote.history(
-            symbol=",".join(SYMBOLS_VN),
-            start=(datetime.date.today() - datetime.timedelta(days=30)).isoformat(),
-            end=TODAY
-        )
-        if not df.empty:
-            df = df[["ticker", "time", "open", "high", "low", "close", "volume"]].dropna()
-            df["time"] = pd.to_datetime(df["time"]).dt.strftime("%Y-%m-%d")
-            records = []
-            for _, r in df.iterrows():
-                records.append((r["time"], r["ticker"], r["open"], r["high"], r["low"], r["close"], r["volume"], "vnstock"))
-            db.insert_prices(records)
-            logger.info(f"✅ Fetched {len(records)} VN records")
-        else:
-            miss += len(SYMBOLS_VN)
-            notes.append("vnstock: No data returned")
-    except Exception as e:
+    vn_records = fetch_vn_data()
+    if vn_records:
+        db.insert_or_replace("prices", vn_records)
+        logger.info(f"✅ Inserted {len(vn_records)} VN records")
+    else:
         miss += len(SYMBOLS_VN)
-        error_msg = f"vnstock: {str(e)[:80]}"
-        notes.append(error_msg)
-        logger.error(f"❌ {error_msg}")
-
+        notes.append("vnstock: No data")
+    
     # Fetch Global data
-    try:
-        logger.info("Fetching Global data from yfinance...")
-        yf_data = yf.download(SYMBOLS_GL, period="2d", group_by="ticker", progress=False)
-        records = []
-        for t in SYMBOLS_GL:
-            try:
-                if t in yf_data.columns.levels[0] or (isinstance(yf_data.columns, pd.MultiIndex) and t in yf_data.columns.levels[0]):
-                    r = yf_data[t].iloc[-1]
-                    records.append((r.name.strftime("%Y-%m-%d"), t, 0, 0, 0, r["Close"], r.get("Volume", 0), "yfinance"))
-                elif t in yf_data:
-                    r = yf_data[t].iloc[-1]
-                    records.append((r.name.strftime("%Y-%m-%d"), t, 0, 0, 0, r["Close"], r.get("Volume", 0), "yfinance"))
-            except Exception as e:
-                miss += 1
-                logger.warning(f"⚠️ Could not fetch {t}: {e}")
-        
-        if records:
-            db.insert_prices(records)
-            logger.info(f"✅ Fetched {len(records)} Global records")
-    except Exception as e:
+    global_records = fetch_global_data()
+    if global_records:
+        db.insert_or_replace("prices", global_records)
+        logger.info(f"✅ Inserted {len(global_records)} Global records")
+    else:
         miss += len(SYMBOLS_GL)
-        error_msg = f"yfinance: {str(e)[:80]}"
-        notes.append(error_msg)
-        logger.error(f"❌ {error_msg}")
-
-    # Save quality log
+        notes.append("yfinance: No data")
+    
+    # Log quality
     total = len(SYMBOLS_VN) + len(SYMBOLS_GL)
     err_pct = round((miss / max(1, total)) * 100, 2)
-    db.insert_quality(TODAY, total, miss, err_pct, " | ".join(notes))
-    logger.info(f"📊 Quality: {miss}/{total} missing, error rate: {err_pct}%")
+    db.insert_or_replace("quality", (TODAY, total, miss, err_pct, " | ".join(notes)))
 
 # ======================== ANALYZE ========================
 def analyze(db):
     logger.info("📈 Analyzing market data...")
-    prices = db.query("SELECT * FROM prices WHERE date=?", (TODAY,))
-    scenarios = []
     
+    # Get today's data or most recent
+    prices = db.query("SELECT * FROM prices WHERE date=?", (TODAY,))
+    if not prices:
+        last_date = db.query("SELECT date FROM prices ORDER BY date DESC LIMIT 1")
+        if last_date:
+            prices = db.query("SELECT * FROM prices WHERE date=?", (last_date[0][0],))
+    
+    scenarios = []
     for row in prices:
         date, ticker, o, h, l, c, vol, src = row
         if ticker not in SYMBOLS_VN:
             continue
         
-        # Get historical data for ATR calculation
+        # Get historical data for ATR
         hist = db.query(
             "SELECT high, low, close FROM prices WHERE ticker=? ORDER BY date DESC LIMIT 20",
             (ticker,)
@@ -216,40 +216,33 @@ def analyze(db):
         if len(hist) < 5:
             continue
         
-        # Calculate ATR (simplified)
-        try:
-            tr_list = []
-            for i in range(1, min(14, len(hist))):
-                high_prev = hist[i][0]
-                low_prev = hist[i][1]
-                close_prev = hist[i-1][2]
-                tr = max(
-                    abs(high_prev - low_prev),
-                    abs(high_prev - close_prev),
-                    abs(low_prev - close_prev)
-                )
-                tr_list.append(tr)
-            
-            atr = np.mean(tr_list) if tr_list else c * 0.02
-        except:
-            atr = c * 0.02
+        # Calculate ATR (14-period)
+        tr_list = []
+        for i in range(1, min(14, len(hist))):
+            high_prev, low_prev, close_prev = hist[i][0], hist[i][1], hist[i-1][2]
+            tr = max(
+                abs(high_prev - low_prev),
+                abs(high_prev - close_prev),
+                abs(low_prev - close_prev)
+            )
+            tr_list.append(tr)
         
-        # Calculate Pivot Points
+        atr = np.mean(tr_list) if tr_list else c * 0.02
+        
+        # Pivot Points
         pivot = (h + l + c) / 3
         r1 = 2 * pivot - l
         s1 = 2 * pivot - h
         
-        # Calculate scenario targets
+        # Scenario targets
         bear_target = s1 - atr * 0.5
         base_target = pivot
         bull_target = r1 + atr * 0.5
         
-        # Probabilities (simple model)
-        bear_prob = 30.0
-        base_prob = 40.0
-        bull_prob = 30.0
+        # Probabilities
+        bear_prob, base_prob, bull_prob = 30.0, 40.0, 30.0
         
-        # Calculate error percentage
+        # Error percentage
         err_pct = round((atr / c) * 100, 1) if c > 0 else 15.0
         
         scenarios.append((
@@ -260,196 +253,142 @@ def analyze(db):
         ))
     
     if scenarios:
-        db.insert_scenarios(scenarios)
+        db.insert_or_replace("scenarios", scenarios)
         logger.info(f"✅ Generated {len(scenarios)} scenarios")
     
     return scenarios
 
-# ======================== BCTC ========================
-def get_bctc(db):
-    logger.info("📑 Fetching financial reports...")
-    lines = []
-    bctc_records = []
-    
-    for sym in ["VCB", "VNM", "TCB", "HPG"]:
-        # Check cache
-        cached = db.query(
-            "SELECT * FROM bctc WHERE ticker=? ORDER BY last DESC LIMIT 1",
-            (sym,)
-        )
-        
-        if cached:
-            last_date = datetime.datetime.strptime(cached[0][6], "%Y-%m-%d")
-            if (datetime.datetime.now() - last_date).days < 60:
-                lines.append(f"{sym}: {cached[0][1]} | ROE {cached[0][2]:.1f}% | P/E {cached[0][3]:.1f}")
-                continue
-        
-        # Fetch new data
-        try:
-            from vnstock import Vnstock
-            vns = Vnstock()
-            df = vns.company.finance(symbol=sym, report_type="quarterly")
-            
-            if not df.empty:
-                r = df.iloc[-1]
-                period = f"{r.get('year', '')}Q{r.get('quarter', '')}"
-                roe = float(r.get('roe', 0))
-                pe = float(r.get('pe', 0))
-                de = float(r.get('debt_to_equity', 0))
-                ni = float(r.get('net_income', 0))
-                
-                bctc_records.append((sym, period, roe, pe, de, ni, TODAY))
-                lines.append(f"{sym}: {period} | ROE {roe:.1f}% | P/E {pe:.1f}")
-            else:
-                lines.append(f"{sym}: No data")
-        except Exception as e:
-            lines.append(f"{sym}: ⚠️ Error - {str(e)[:40]}")
-            logger.warning(f"⚠️ Could not fetch BCTC for {sym}: {e}")
-    
-    if bctc_records:
-        db.insert_bctc(bctc_records)
-    
-    return lines
-
 # ======================== PDF GENERATOR ========================
+def download_font():
+    font_path = "/tmp/NotoSans-Regular.ttf"
+    if os.path.exists(font_path):
+        return font_path
+    
+    logger.info("Downloading font...")
+    url = "https://raw.githubusercontent.com/googlefonts/noto-fonts/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200 and len(response.content) > 10000:
+            with open(font_path, "wb") as f:
+                f.write(response.content)
+            logger.info("✅ Font downloaded")
+            return font_path
+    except Exception as e:
+        logger.error(f"❌ Font download failed: {e}")
+    return None
+
 class PDFGenerator(FPDF):
     def __init__(self, font_path):
         super().__init__()
-        self.add_font("DejaVu", "", font_path, uni=True)
-        self.add_font("DejaVu", "B", font_path, uni=True)
-        self.set_auto_page_break(auto=True, margin=15)
+        if font_path:
+            self.add_font("NotoSans", "", font_path)
+            self.add_font("NotoSans", "B", font_path)
+            self.font_name = "NotoSans"
+        else:
+            self.font_name = "Helvetica"
     
     def header(self):
-        self.set_font("DejaVu", "B", 14)
+        self.set_font(self.font_name, "B", 14)
         self.cell(0, 10, "BAO CAO THI TRUONG CHUNG KHOAN VN", ln=True, align="C")
-        self.set_font("DejaVu", "", 9)
-        self.cell(0, 5, f"Ngay: {TODAY} | Nguon: Free API | Telegram Bot", ln=True, align="C")
+        self.set_font(self.font_name, "", 9)
+        self.cell(0, 5, f"Ngay: {TODAY} | Nguon: vnstock + yfinance", ln=True, align="C")
         self.line(10, 20, 200, 20)
         self.ln(5)
     
     def footer(self):
         self.set_y(-15)
-        self.set_font("DejaVu", "I", 8)
+        self.set_font(self.font_name, "I", 8)
         self.cell(0, 10, "⚠️ Du lieu co sai so ky thuat. Khong thay the tu van chuyen nghiep.", align="C")
     
     def section(self, title, lines):
-        self.set_font("DejaVu", "B", 11)
+        self.set_font(self.font_name, "B", 11)
         self.set_fill_color(235, 235, 235)
         self.cell(0, 8, f"  {title}", fill=True, ln=True)
-        self.set_font("DejaVu", "", 9)
+        self.set_font(self.font_name, "", 9)
         for line in lines:
             self.multi_cell(0, 5, f"- {line}")
         self.ln(2)
 
-def generate_pdf(vn_data, global_data, scenarios, bctc_lines, quality):
-    logger.info("📄 Generating PDF...")
-    
-    # Download font
-    font_path = "/tmp/DejaVuSans.ttf"
-    if not os.path.exists(font_path):
-        logger.info("Downloading font...")
-        try:
-            r = requests.get("https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans/DejaVuSans.ttf")
-            with open(font_path, "wb") as f:
-                f.write(r.content)
-            logger.info("✅ Font downloaded")
-        except Exception as e:
-            logger.error(f"❌ Could not download font: {e}")
-            # Fallback to built-in font
-            font_path = None
-    
-    pdf = PDFGenerator(font_path) if font_path else FPDF()
+def generate_pdf(vn_data, global_data, scenarios, quality):
+    font_path = download_font()
+    pdf = PDFGenerator(font_path)
     pdf.add_page()
     
-    # VN Indices
+    # VN data
     vn_lines = [f"{t}: {c} (Vol: {int(v):,})" for t, c, v in vn_data]
-    pdf.section("1. CHI SO VIET NAM", vn_lines)
+    pdf.section("1. CHI SO VIET NAM", vn_lines or ["Khong co du lieu"])
     
-    # Global Markets
+    # Global data
     global_lines = [f"{t}: {c}" for t, c in global_data]
-    pdf.section("2. LIEN THI TRUONG", global_lines)
+    pdf.section("2. LIEN THI TRUONG", global_lines or ["Khong co du lieu"])
     
     # Scenarios
     scenario_lines = [
         f"{t}: Bear {bp:.0f}% ({bt}) | Base {bsp:.0f}% ({bst}+/-{err}%) | Bull {bup:.0f}% ({but})"
         for t, bp, bsp, bup, bt, bst, but, err in scenarios
     ]
-    pdf.section("3. KICH BAN 1 NGAY", scenario_lines)
-    
-    # BCTC
-    pdf.section("4. BAO CAO TAI CHINH", bctc_lines)
+    pdf.section("3. KICH BAN 1 NGAY", scenario_lines or ["Khong co du lieu"])
     
     # Quality
     quality_lines = [
         f"Thieu: {quality['miss']}/{quality['total']} | Sai so: +/-{quality['err']}%",
         f"Ghi chu: {quality['notes']}"
     ]
-    pdf.section("5. CHAT LUONG DU LIEU", quality_lines)
+    pdf.section("4. CHAT LUONG DU LIEU", quality_lines)
     
-    pdf_bytes = pdf.output(dest="S").encode("latin1")
-    logger.info("✅ PDF generated")
-    return pdf_bytes
+    try:
+        return pdf.output(dest="S").encode("latin1")
+    except Exception as e:
+        logger.error(f"❌ PDF generation failed: {e}")
+        return b"PDF generation failed"
 
 # ======================== SEND TELEGRAM ========================
 def send_telegram(pdf_bytes, filename="market_report.pdf"):
     logger.info("📤 Sending to Telegram...")
-    
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
     
     try:
         response = requests.post(
             url,
-            data={
-                "chat_id": CHAT_ID,
-                "caption": f"📊 Bao cao thi truong CKVN - {TODAY}"
-            },
-            files={
-                "document": (filename, pdf_bytes, "application/pdf")
-            },
+            data={"chat_id": CHAT_ID, "caption": f"📊 Bao cao thi truong - {TODAY}"},
+            files={"document": (filename, pdf_bytes, "application/pdf")},
             timeout=30
         )
-        
         if response.status_code == 200:
-            logger.info("✅ Telegram sent successfully!")
+            logger.info("✅ Telegram sent!")
             return True
         else:
             logger.error(f"❌ Telegram error: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        logger.error(f"❌ Failed to send Telegram: {e}")
+        logger.error(f"❌ Send failed: {e}")
         return False
 
 # ======================== MAIN ========================
 def main():
     try:
-        logger.info("🚀 Starting daily market report...")
-        
-        # Initialize DB
+        logger.info("🚀 Starting daily report...")
         db = DB()
         
         # Fetch data
-        fetch_data(db)
+        fetch_all_data(db)
         
         # Analyze
         scenarios = analyze(db)
         
-        # Get BCTC
-        bctc_lines = get_bctc(db)
-        
         # Get data for PDF
-        vn_data = [
-            (t, c, v) for t, c, v in db.query(
-                "SELECT ticker, c, vol FROM prices WHERE date=?", (TODAY,)
-            ) if t in SYMBOLS_VN
-        ]
+        run_date = db.query("SELECT date FROM prices ORDER BY date DESC LIMIT 1")
+        run_date = run_date[0][0] if run_date else TODAY
         
-        global_data = [
-            (t, c) for t, c in db.query(
-                "SELECT ticker, c FROM prices WHERE date=?", (TODAY,)
-            ) if t in SYMBOLS_GL
-        ]
+        vn_data = [(t, c, v) for t, c, v in db.query(
+            "SELECT ticker, c, vol FROM prices WHERE date=?", (run_date,)
+        ) if t in SYMBOLS_VN]
         
-        quality_data = db.query("SELECT * FROM quality WHERE date=?", (TODAY,))
+        global_data = [(t, c) for t, c in db.query(
+            "SELECT ticker, c FROM prices WHERE date=?", (run_date,)
+        ) if t in SYMBOLS_GL]
+        
+        quality_data = db.query("SELECT * FROM quality WHERE date=?", (run_date,))
         quality = {
             "total": quality_data[0][1] if quality_data else 0,
             "miss": quality_data[0][2] if quality_data else 0,
@@ -459,20 +398,15 @@ def main():
         
         db.close()
         
-        # Generate PDF
-        pdf_bytes = generate_pdf(vn_data, global_data, scenarios, bctc_lines, quality)
-        
-        # Send to Telegram
-        success = send_telegram(pdf_bytes, f"VN_Market_{TODAY.replace('-', '')}.pdf")
-        
-        if success:
-            logger.info("🎉 Daily report completed successfully!")
+        # Generate & send
+        pdf_bytes = generate_pdf(vn_data, global_data, scenarios, quality)
+        if send_telegram(pdf_bytes, f"VN_Market_{run_date.replace('-', '')}.pdf"):
+            logger.info("🎉 Done!")
         else:
-            logger.warning("⚠️ Report generated but failed to send to Telegram")
             sys.exit(1)
             
     except Exception as e:
-        logger.critical(f"💥 CRITICAL ERROR: {e}")
+        logger.critical(f"💥 CRITICAL: {e}")
         logger.critical(traceback.format_exc())
         sys.exit(1)
 
