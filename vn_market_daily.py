@@ -15,6 +15,17 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 VNSTOCK_API_KEY = os.getenv("VNSTOCK_API_KEY")
 
+# Debug credentials
+logger.info("=" * 60)
+logger.info("🔍 CHECKING CREDENTIALS:")
+logger.info(f"  BOT_TOKEN exists: {bool(BOT_TOKEN)}")
+logger.info(f"  CHAT_ID exists: {bool(CHAT_ID)}")
+logger.info(f"  VNSTOCK_API_KEY exists: {bool(VNSTOCK_API_KEY)}")
+if VNSTOCK_API_KEY:
+    logger.info(f"  VNSTOCK_API_KEY length: {len(VNSTOCK_API_KEY)}")
+    logger.info(f"  VNSTOCK_API_KEY preview: {VNSTOCK_API_KEY[:10]}...")
+logger.info("=" * 60)
+
 if not (BOT_TOKEN and CHAT_ID):
     logger.error("❌ Missing Telegram credentials!")
     sys.exit(1)
@@ -69,72 +80,95 @@ class DB:
 # ======================== FETCH VN DATA (vnstock) ========================
 def fetch_vn_data():
     """
-    Fetch VN data using vnstock with API key (if available).
-    With API key: 60 requests/minute
-    Without API key: 20 requests/minute
+    Fetch VN data using vnstock with multiple authentication methods.
     """
     logger.info("📥 Fetching VN data via vnstock...")
     
     try:
         from vnstock.api.quote import Quote
         
-        # Get API key from environment variable
         api_key = os.getenv("VNSTOCK_API_KEY")
         
-        if api_key:
-            logger.info("✅ Using VNSTOCK API Key (60 req/min)")
-        else:
-            logger.warning("⚠️ No API Key found - using Guest mode (20 req/min)")
+        logger.info(f"🔑 API Key status: {'Found' if api_key else 'NOT FOUND'}")
         
         all_data = []
-        for symbol in SYMBOLS_VN:
+        for i, symbol in enumerate(SYMBOLS_VN):
             try:
-                # Initialize Quote with API key if available
+                # Try different authentication methods
+                quote = None
+                
+                # Method 1: Pass api_key parameter
                 if api_key:
-                    quote = Quote(symbol=symbol, source='VCI', api_key=api_key)
+                    try:
+                        logger.info(f"  Trying Method 1: api_key parameter for {symbol}")
+                        quote = Quote(symbol=symbol, source='VCI', api_key=api_key)
+                    except Exception as e1:
+                        logger.warning(f"  Method 1 failed: {str(e1)[:50]}")
+                        
+                        # Method 2: Try without api_key (guest mode)
+                        try:
+                            logger.info(f"  Trying Method 2: guest mode for {symbol}")
+                            quote = Quote(symbol=symbol, source='VCI')
+                        except Exception as e2:
+                            logger.warning(f"  Method 2 failed: {str(e2)[:50]}")
+                            # Method 3: Try with token parameter
+                            try:
+                                logger.info(f"  Trying Method 3: token parameter for {symbol}")
+                                quote = Quote(symbol=symbol, source='VCI', token=api_key)
+                            except Exception as e3:
+                                logger.error(f"  Method 3 failed: {str(e3)[:50]}")
+                                continue
+                        else:
+                            logger.info("  ✅ Method 2 (guest) worked!")
+                    else:
+                        logger.info("  ✅ Method 1 (api_key) worked!")
                 else:
+                    # No API key - use guest mode
+                    logger.info(f"  Using guest mode (no API key) for {symbol}")
                     quote = Quote(symbol=symbol, source='VCI')
                 
-                # Fetch 30 days of history
-                df = quote.history(period='30d')
-                
-                if df is not None and not df.empty:
-                    latest = df.iloc[-1]
-                    date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
+                # Fetch data
+                if quote:
+                    df = quote.history(period='30d')
                     
-                    all_data.append((
-                        date_str, symbol,
-                        float(latest.get('Open', 0)),
-                        float(latest.get('High', 0)),
-                        float(latest.get('Low', 0)),
-                        float(latest.get('Close', 0)),
-                        float(latest.get('Volume', 0)),
-                        'vnstock'
-                    ))
-                    logger.info(f"✅ Fetched {symbol}: {latest.get('Close', 0)}")
-                    
-                    # Rate limiting:
-                    # - With API key (60/min): sleep 1.0 second
-                    # - Without API key (20/min): sleep 3.5 seconds
-                    sleep_time = 1.0 if api_key else 3.5
-                    time.sleep(sleep_time)
-                else:
-                    logger.warning(f"⚠️ No data for {symbol}")
+                    if df is not None and not df.empty:
+                        latest = df.iloc[-1]
+                        date_str = latest.name.strftime("%Y-%m-%d") if hasattr(latest.name, 'strftime') else TODAY
+                        
+                        all_data.append((
+                            date_str, symbol,
+                            float(latest.get('Open', 0)),
+                            float(latest.get('High', 0)),
+                            float(latest.get('Low', 0)),
+                            float(latest.get('Close', 0)),
+                            float(latest.get('Volume', 0)),
+                            'vnstock'
+                        ))
+                        logger.info(f"✅ Fetched {symbol}: {latest.get('Close', 0)}")
+                        
+                        # Rate limiting - be conservative
+                        if api_key:
+                            time.sleep(1.2)  # 60/min = 1/sec, add buffer
+                        else:
+                            time.sleep(3.5)  # 20/min = 1/3sec
+                    else:
+                        logger.warning(f"⚠️ No data for {symbol}")
                     
             except Exception as e:
-                logger.error(f"❌ Error fetching {symbol}: {str(e)[:60]}")
-                # Still wait to respect rate limit
-                time.sleep(1.0 if api_key else 3.5)
+                logger.error(f"❌ Error fetching {symbol}: {str(e)[:80]}")
+                logger.error(f"   Full error: {traceback.format_exc()[:200]}")
+                time.sleep(2.0)
                 continue
         
         logger.info(f"📊 Total fetched: {len(all_data)}/{len(SYMBOLS_VN)} symbols")
         return all_data
         
-    except ImportError:
-        logger.error("❌ vnstock not installed. Run: pip install vnstock")
+    except ImportError as e:
+        logger.error(f"❌ vnstock not installed: {e}")
         return []
     except Exception as e:
         logger.error(f"❌ vnstock fetch failed: {e}")
+        logger.error(traceback.format_exc())
         return []
 
 # ======================== FETCH GLOBAL DATA (yfinance) ========================
